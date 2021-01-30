@@ -61,6 +61,13 @@ class Driver
 		ingest_packet(packet) if packet
 	end
 
+	def send(packet, destination, priority)
+		return false unless allow_tx?
+		packet = packet.serialize if packet.is_a?(PGN)
+		packet = packet.merge(:destination => destination, :priority => priority)
+		write_packet(packet)
+	end
+
 	def packets_coalesced?
 		false
 	end
@@ -87,6 +94,10 @@ class Driver
 	protected
 
 	def read_packet
+	end
+
+	def write_packet(packet)
+		false
 	end
 
 	def ingest_packet(packet)
@@ -220,6 +231,10 @@ class YDNU_RawDriver < YDNUDriverBase
 		})
 	end
 
+	def write_packet(packet)
+		false
+	end
+
 	def packets_coalesced?
 		false
 	end
@@ -236,6 +251,10 @@ class YDNU_N2KDriver < YDNUDriverBase
 			packet = ingest_byte
 			return packet if packet
 		end
+	end
+
+	def write_packet(packet)
+		false
 	end
 
 	def packets_coalesced?
@@ -421,6 +440,20 @@ end
 
 #----------------------------------------------------------------------------
 
+module Enumerable
+	def index_by
+		result = {}
+		each do |item|
+			index = yield item
+			result[index] ||= []
+			result[index] << item
+		end
+		result
+	end
+end
+
+#----------------------------------------------------------------------------
+
 class PGNDatabase
 	def initialize
 		@pgns = {}
@@ -431,12 +464,31 @@ class PGNDatabase
 			JSON.load(file, nil, :symbolize_names => true, :create_additions => false)
 		end
 		pgn_list = db.delete(:PGNs)
-		@pgns = Hash[pgn_list.map { |pgn| [pgn[:PGN], fixup_pgn(pgn)] }].deep_freeze
+					.map { |pgn| fixup_pgn(pgn) }
+					.index_by { |pgn| pgn[:PGN] }
+					.map do |pgn, list|
+						list = list
+							.index_by { |pgn| pgn[:Id] }
+							.map { |id, pgn2| [id, ensure_one(pgn2)] }
+							.to_h
+						[pgn, list]
+					end.to_h
+		@pgns = apply_modifications(pgn_list).deep_freeze
 		@db = db.deep_freeze
 	end
 
+	def find(index, id = nil)
+		list = @pgns[index]
+		return nil unless list
+		if list.size > 1
+			list[id] || list[:default] || ambiguous(index)
+		else
+			list.first.last
+		end
+	end
+
 	def [](index)
-		@pgns[index]
+		find(index)
 	end
 
 	def key?(index)
@@ -445,10 +497,133 @@ class PGNDatabase
 
 	protected
 
+	def ensure_one(pgns)
+		message(:debug, "duplicate ids for PGN: #{pgns}") if pgns.size > 1
+		pgns.first
+	end
+
+	def ambiguous(index)
+		raise ArgumentError.new("PGN #{index} must specify id to disambiguate")
+	end
+
+	# Apply local modifications to PGN database
+	def apply_modifications(pgns)
+		raise NotImplementedError unless pgns[60928].size == 1
+		pgns[60928].first.last[:Fields][0][:Type] = PGN::FIELDTYPE_INTEGER
+		set_defaults(pgns)
+	end
+
+	def set_defaults(pgns)
+		pgns.each do |_, list|
+			next unless list.size > 1
+			default = find_without_matches(list)
+			list[:default] = default if default
+		end
+	end
+
+	def find_without_matches(pgns)
+		pgns.values.find do |pgn|
+			pgn[:Fields].none? { |field| field.key?(:Match) }
+		end
+	end
+
 	def fixup_pgn(pgn)
 		pgn[:Type] = pgn[:Type].to_sym
+		pgn[:Fields] = pgn[:Fields].values if pgn[:Fields].is_a?(Hash)
 		pgn
 	end
+end
+
+#----------------------------------------------------------------------------
+
+class GenericValue
+	attr_reader :to_f
+
+	def initialize(value)
+		@to_f = value.to_f
+	end
+
+	def inspect
+		to_s
+	end
+end
+
+class NauticalMileDistanceMeters < GenericValue
+	def to_nm
+		to_f / 1852.0
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_nm)} nm"
+	end
+end
+
+class DepthMeters < GenericValue
+	def to_feet
+		to_f * 3.28084
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_feet)} ft"
+	end
+end
+
+class KnotSpeedMetersPerSecond < GenericValue
+	def to_knots
+		to_f * 1.94384
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_knots)} kts"
+	end
+end
+
+class AngleRadians < GenericValue
+	RADIANS_TO_DEGREES = 180.0 / Math::PI
+
+	def to_degrees
+		to_f * RADIANS_TO_DEGREES
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_degrees)}°"
+	end
+end
+
+class TemperatureKelvin < GenericValue
+	def to_celcius
+		to_f - 273.15
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_celcius)}°C"
+	end
+end
+
+class Position < GenericValue
+	def to_s
+		value = to_f
+		suffix = value >= 0 ? self.class::POS_SUFFIX : self.class::NEG_SUFFIX
+		value = (value.abs * 60.0 * 1000.0 + 0.5).to_i
+		minutes_frac = value % 1000
+		value /= 1000
+		minutes_whole = value % 60
+		value /= 60
+		degrees_whole = value
+		sprintf("%0#{self.class::DEGREES_DIGITS}d°%02d.%03d'%s", degrees_whole, minutes_whole, minutes_frac, suffix)
+	end
+end
+
+class PositionLatitude < Position
+	DEGREES_DIGITS = 2
+	POS_SUFFIX = 'N'
+	NEG_SUFFIX = 'S'
+end
+
+class PositionLongitude < Position
+	DEGREES_DIGITS = 3
+	POS_SUFFIX = 'E'
+	NEG_SUFFIX = 'W'
 end
 
 #----------------------------------------------------------------------------
@@ -476,7 +651,7 @@ class PacketInterpreter
 
 	def fields(pgn_desc, packet)
 		# TODO: Handle repeating fields
-		result = Hash[pgn_desc[:Fields].map { |*args| interpret_field(pgn_desc, args[0], packet) }]
+		result = Hash[pgn_desc[:Fields].map { |field_desc| interpret_field(pgn_desc, field_desc, packet) }]
 		if result['date'] && result['time']
 			timestamp = result['date'][:value] * 24 * 60 * 60 + result['time'][:value]
 			result.merge!('datetime' => { :value => timestamp, :display_value => Time.at(timestamp).utc })
@@ -485,7 +660,6 @@ class PacketInterpreter
 	end
 
 	def interpret_field(pgn_desc, field_desc, packet)
-		field_desc = field_desc.last if field_desc.respond_to?(:last)
 		field_value = {
 			:description => field_desc[:Name] || field_desc[:Id],
 		}
@@ -760,6 +934,22 @@ class PacketInterpreter
 		717 => 'YACHT DEVICES LTD.',
 	}.deep_freeze
 
+	MANUFACTURERS.each do |id, name|
+		{
+			'&' => '_AND_',
+			'.' => '',
+			',' => '',
+			'(' => '',
+			')' => '',
+			'/' => '_',
+			'-' => '_',
+			' ' => '_',
+		}.each do |str, repl|
+			name = name.gsub(str, repl)
+		end
+		const_set("MANUFACTURER_#{name.upcase}", id)
+	end
+
 	EMPTY_HASH = {}.freeze
 end
 
@@ -838,10 +1028,7 @@ end
 class PGN
 	attr_reader :priority
 
-	def initialize(pgn_database, fields = {})
-		raise ArgumentError.new("PGN ID #{pgn_id} not in database") unless pgn_database.key?(pgn_id)
-		@_pgn_desc = pgn_database[pgn_id]
-		@priority = 6
+	def initialize(fields = {})
 		@fields = {}
 		fields.each do |key, value|
 			_set_field(key, value)
@@ -854,8 +1041,8 @@ class PGN
 
 	# returns a packet
 	def serialize
-		buffer = ByteBuffer.new(length: _pgn_desc[:Length])
-		_pgn_desc[:Fields].each { |*args| _serialize_field(args[0], buffer) }
+		buffer = ByteBuffer.new(length: self.class.pgn_desc[:Length])
+		self.class.pgn_desc[:Fields].each { |field_desc| _serialize_field(field_desc, buffer) }
 		{
 			:pgn => pgn_id,
 			:payload => buffer.data,
@@ -863,13 +1050,35 @@ class PGN
 	end
 
 	# TODO: move deserialization here and get rid of PGN interpreter
-	def self.deserialize(pgn_database, pgn_interpreter, packet)
+	def self.deserialize(pgn_interpreter, packet)
 		pgn_id = packet[:pgn]
 		pgn_class = class_for_id(pgn_id)
 		return nil unless pgn_class		# should not be possible
-		pgn_obj = pgn_class.new(pgn_database)
-		pgn_obj._deserialize(pgn_interpreter, packet)
+		pgn_obj = pgn_class.new
+		pgn_obj.send(:_deserialize, pgn_interpreter, packet)
 		pgn_obj
+	end
+
+	def to_s
+		fields = _field_list.map do |field_name|
+			field_value = send("f_#{field_name}")
+			"#{field_name}=#{field_value.inspect}"
+		end
+		name = self.class.name
+		name = name[0...-3] if name&.end_with?('PGN')
+		name ||= "PGN#{pgn_id}"
+		"<#{name}: #{fields.join(' ')}>"
+	end
+
+	def ==(other)
+		return false unless self.class == other.class
+		_field_list.all? do |field_name|
+			_get_field(field_name) == other._get_field(field_name)
+		end
+	end
+
+	def dup
+		super.tap { |o| o._dup }
 	end
 
 	def respond_to?(meth_name, include_all = false)
@@ -892,22 +1101,18 @@ class PGN
 		end
 	end
 
-	protected
-
-	attr_reader :_pgn_desc
-
-	# Override as needed
-	def permitted_fields
-		nil		# nil means all fields are permitted
+	def field
+		@field_proxy ||= FieldProxy.new(self)
 	end
 
+	protected
+
 	# Override as needed
-	def forbidden_fields
-		nil		# nil means no fields are forbidden
+	def allow_field?(name)
+		!name.to_s.start_with?('reserved')
 	end
 
 	def _serialize_field(field_desc, buffer)
-		field_desc = field_desc.last if field_desc.respond_to?(:last)
 		field_id = field_desc[:Id].to_sym
 		return unless @fields.key?(field_id)
 		field_type = field_desc[:Type]
@@ -968,11 +1173,11 @@ class PGN
 
 	def _deserialize(packet_interpreter, packet)
 		interp = packet_interpreter.interpret(packet)
-		unless interp[:id] == self.class::PGN_ID
+		unless interp[:pgn] == self.class::PGN_ID
 			raise ArgumentError
 		end
 		@fields = {}
-		field_list.each do |field_name|
+		_field_list.each do |field_name|
 			field_value = interp[:fields][field_name.to_s]
 			field_value = field_value[:value] unless field_value.nil?
 			_set_field(field_name, field_value) unless field_value.nil?
@@ -988,7 +1193,7 @@ class PGN
 	end
 
 	def _undefined(name)
-		raise NoMethodError.new("undefined method `#{name}' for #{self}")
+		raise NoMethodError.new("undefined field `#{name}' for #{self}")
 	end
 
 	def _has_field?(name)
@@ -1000,31 +1205,44 @@ class PGN
 	end
 
 	def _construct_field_list
-		fields = _pgn_desc[:Fields]
-		fields = fields.values if fields.is_a?(Hash)
+		fields = self.class.pgn_desc[:Fields]
 		fields = fields.map { |f| f[:Id].to_sym }.uniq
-		if permitted_fields
-			fields &= permitted_fields
-		end
-		if forbidden_fields
-			fields -= forbidden_fields
-		end
+		fields = fields.select { |f| allow_field?(f) }
 		fields.to_set.freeze
 	end
 
 	def _method_to_field(meth_name)
 		field_name = meth_name.to_s
+		return nil unless field_name.start_with?('f_')
+		field_name = field_name[2..]
 		suffix = field_name.end_with?('=') ? '=' : nil
 		field_name = field_name[0...-1] if suffix
 		[field_name.to_sym, suffix]
 	end
 
-	class << self
-		private
+	def _dup
+		@fields = @fields.dup
+	end
 
-		def class_for_id(pgn_id)
-			classes_by_id[pgn_id] ||= new_class_for_id(pgn_id)
+	class << self
+		attr_accessor :pgn_database
+
+		def pgn_desc
+			PGN.pgn_database[self::PGN_ID]
 		end
+
+		def class_for_id(pgn_id, &block)
+			classes_by_id[pgn_id] ||= block_given? ? new_class_for_id(pgn_id, &block) : new_class_for_id(pgn_id)
+		end
+
+		def field_type(field_name, type_klass)
+			define_method("f_#{field_name}") do
+				field_value = field[field_name]
+				field_value.nil? ? nil : type_klass.new(field_value)
+			end
+		end
+
+		private
 
 		def classes_by_id
 			@classes_by_id ||= construct_classes_by_id
@@ -1035,8 +1253,21 @@ class PGN
 			Hash[klasses.map { |klass| [klass::PGN_ID, klass] }]
 		end
 
-		def new_class_for_id(pgn_id)
-			Class.new(self) { |k| k.const_set('PGN_ID', pgn_id) }
+		def new_class_for_id(pgn_id, &block)
+			Class.new(self) do |k|
+				k.const_set('PGN_ID', pgn_id)
+				k.module_eval(&block) if block_given?
+			end
+		end
+	end
+
+	class FieldProxy
+		def initialize(obj)
+			@obj = obj
+		end
+
+		def [](name)
+			@obj.send(:_get_field, name)
 		end
 	end
 
@@ -1056,10 +1287,405 @@ class PGN
 	FIELDTYPE_TIME = 'Time'.freeze
 end
 
-class ISORequestPGN < PGN
-	PGN_ID = 59904
-	# Attributes:
-	# => pgn (Integer)
+# Attributes:
+# => f_control (CONTROL_*)
+# => f_groupFunction
+# => f_pgn
+ISOAcknowledgementPGN = PGN.class_for_id(59392) do
+	CONTROL_ACK = 0
+	CONTROL_NAK = 1
+	CONTROL_ACCESS_DENIED = 2
+	CONTROL_ADDRESS_BUSY = 3
+end
+
+# Attributes:
+# => f_pgn (Integer)
+ISORequestPGN = PGN.class_for_id(59904)
+
+# Attributes:
+# => f_uniqueNumber
+# => f_manufacturerCode
+# => f_deviceInstanceLower
+# => f_deviceInstanceUpper
+# => f_deviceFunction
+# => f_deviceClass
+# => f_systemInstance
+# => f_industryGroup
+ISOAddressClaimPGN = PGN.class_for_id(60928)
+
+AddressableMultiFrameProprietaryPGN = PGN.class_for_id(126720)
+
+# Attributes:
+# => f_nmea2000Version
+# => f_productCode
+# => f_modelId
+# => f_softwareVersionCode
+# => f_modelVersion
+# => f_modelSerialCode
+# => f_certificationLevel
+# => f_loadEquivalency
+ProductInformationPGN = PGN.class_for_id(126996)
+
+SpeedPGN = PGN.class_for_id(128259) do
+	field_type :speedWaterReferenced, KnotSpeedMetersPerSecond
+	field_type :speedGroundReferenced, KnotSpeedMetersPerSecond
+end
+
+WaterDepthPGN = PGN.class_for_id(128267) do
+	field_type :depth, DepthMeters
+	field_type :offset, DepthMeters
+	field_type :range, DepthMeters
+end
+
+DistanceLogPGN = PGN.class_for_id(128275) do
+	field_type :log, NauticalMileDistanceMeters
+	field_type :tripLog, NauticalMileDistanceMeters
+end
+
+PositionRapidUpdatePGN = PGN.class_for_id(129025) do
+	field_type :latitude, PositionLatitude
+	field_type :longitude, PositionLongitude
+end
+
+CogSogRapidUpdatePGN = PGN.class_for_id(129026) do
+	field_type :cog, AngleRadians
+	field_type :sog, KnotSpeedMetersPerSecond
+end
+
+GNSSPositionDataPGN = PGN.class_for_id(129029) do
+	field_type :latitude, PositionLatitude
+	field_type :longitude, PositionLongitude
+end
+
+AISClassAPositionReportPGN = PGN.class_for_id(129038) do
+	field_type :latitude, PositionLatitude
+	field_type :longitude, PositionLongitude
+	field_type :heading, AngleRadians
+	field_type :cog, AngleRadians
+	field_type :sog, KnotSpeedMetersPerSecond
+end
+
+AISClassBPositionReportPGN = PGN.class_for_id(129039) do
+	field_type :latitude, PositionLatitude
+	field_type :longitude, PositionLongitude
+	field_type :heading, AngleRadians
+	field_type :cog, AngleRadians
+	field_type :sog, KnotSpeedMetersPerSecond
+end
+
+AISAtonReportPGN = PGN.class_for_id(129041) do
+	field_type :latitude, PositionLatitude
+	field_type :longitude, PositionLongitude
+end
+
+WindDataPGN = PGN.class_for_id(130306) do
+	field_type :windSpeed, KnotSpeedMetersPerSecond
+	field_type :windAngle, AngleRadians
+end
+
+EnvironmentalParametersPGN = PGN.class_for_id(130311) do
+	field_type :temperature, TemperatureKelvin
+end
+
+TemperaturePGN = PGN.class_for_id(130312) do
+	field_type :actualTemperature, TemperatureKelvin
+	field_type :setTemperature, TemperatureKelvin
+end
+
+TemperatureExtendedRangePGN = PGN.class_for_id(130316) do
+	field_type :temperature, TemperatureKelvin
+	field_type :setTemperature, TemperatureKelvin
+end
+
+#----------------------------------------------------------------------------
+
+class NetworkDevice
+	attr_reader :address, :address_claim
+	attr_accessor :product_information
+
+	def initialize(address, address_claim)
+		@address = address
+		@address_claim = address_claim.freeze
+	end
+
+	def to_s
+		attrs = [:address, :address_claim, :product_information].map do |attr_name|
+			"#{attr_name}=#{send(attr_name)}"
+		end
+		"<#{self.class.name}: #{attrs.join(' ')}>"
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class ReadPacketsJob
+	def self.spawn(event_loop, driver, pgn_database)
+		job = self.new(event_loop, driver, pgn_database)
+		event_loop.add_job(job)
+		job
+	end
+
+	attr_reader :driver
+
+	def initialize(event_loop, driver, pgn_database)
+		@event_loop = event_loop
+		@driver = driver
+		@packet_interpreter = PacketInterpreter.new(pgn_database)	# TODO
+	end
+
+	def tick
+		begin
+			packet = driver.update
+		rescue EOFError
+			@event_loop.remove_job(self)
+			@event_loop.exit!
+			return
+		end
+		ingest(packet)
+	end
+
+	private
+
+	def ingest(packet)
+		return unless packet
+		#puts(@packet_interpreter.interpret(packet))
+		pgn = PGN.deserialize(@packet_interpreter, packet)
+		return unless pgn
+		@event_loop.event(:pgn, pgn, packet[:source])
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class EnumerateNetworkDevicesJob
+	DEFAULT_TIMEOUT_S = 15
+	DEFAULT_DEVICE_RESPONSE_TIME_S = 5
+
+	def self.spawn(event_loop, driver, timeout = nil)
+		job = self.new(event_loop, driver)
+		event_loop.add_job(job)
+		job.start_enumeration(timeout)
+		job
+	end
+
+	attr_reader :driver
+
+	def initialize(event_loop, driver)
+		@event_loop = event_loop
+		@driver = driver
+		@devices = {}
+		@end_time = nil
+	end
+
+	def start_enumeration(timeout = nil)
+		timeout ||= DEFAULT_TIMEOUT_S
+		@devices = {}
+		request = ISORequestPGN.new(:pgn => ISOAddressClaimPGN)
+		driver.send(request, Driver::BROADCAST_DESTINATION, 6)
+		@event_loop.event(:begin_device_enumeration)
+		@start_time = Time.now
+		@end_time = @start_time + timeout
+	end
+
+	def tick
+		now = Time.now
+		if @end_time && now >= @end_time
+			@event_loop.remove_job(self)
+			enumerate_stragglers
+			@event_loop.event(:end_device_enumeration)
+			return
+		end
+		@devices.values.each do |device_info|
+			unless device_info[:event_triggered]
+				end_time = device_info[:time] + DEFAULT_DEVICE_RESPONSE_TIME_S
+				trigger_event(device_info) if now >= end_time
+			end
+		end
+	end
+
+	private
+
+	def event_pgn(pgn, source)
+		case pgn
+			when ISOAddressClaimPGN
+				address_claim(source, pgn)
+			when ProductInformationPGN
+				product_information(source, pgn)
+		end
+	end
+
+	def address_claim(source_address, pgn)
+		device_info = @devices[source_address]
+		return if device_info && device_info[:device].address_claim == pgn
+		@devices[source_address] = {
+			:device => NetworkDevice.new(source_address, pgn),
+			:time => Time.now,
+			:event_triggered => false,
+		}
+		request = ISORequestPGN.new(:pgn => ProductInformationPGN)
+		driver.send(request, source_address, 6)
+	end
+
+	def product_information(source_address, pgn)
+		device_info = @devices[source_address]
+		return unless device_info
+		device_info[:device].product_information = pgn
+		trigger_event(device_info)
+	end
+
+	def trigger_event(device_info)
+		return if device_info[:event_triggered]
+		device_info[:event_triggered] = true
+		@event_loop.event(:device_discovered, device_info[:device])
+	end
+
+	def enumerate_stragglers
+		@devices.values.each do |device_info|
+			trigger_event(device_info)
+		end
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class AirmarCalibratePaddleWheelJob
+	DEFAULT_TIMEOUT_S = 5
+
+	def self.spawn(event_loop, driver, device = nil, timeout = nil)
+		job = self.new(event_loop, driver, timeout)
+		event_loop.add_job(job)
+		device ? job.start_calibration(device) : job.start_discovery
+		job
+	end
+
+	def initialize(event_loop, driver, timeout = nil)
+		@event_loop = event_loop
+		@driver = driver
+		@device = nil
+		@end_time = nil
+		@timeout = timeout || DEFAULT_TIMEOUT_S
+	end
+
+	def start_discovery
+		EnumerateNetworkDevicesJob.spawn(@event_loop, @driver)
+	end
+
+	def start_calibration(device)
+		if compatible_device?(device)
+			@device = device
+			#request = ISORequestPGN.new(:pgn => ISOAddressClaimPGN)
+			#@driver.send(request, device.address, 6)
+			@event_loop.event(:begin_calibration, device)
+			@start_time = Time.now
+			@end_time = @start_time + @timeout
+		else
+			calibration_failed
+		end
+	end
+
+	private
+
+	def calibration_failed
+		end_with_event(:calibration_failed)
+	end
+
+	def end_with_event(event)
+		@event_loop.event(event)
+		@event_loop.remove_job(self)
+	end
+
+	def compatible_device?(device)
+		return false unless device.address_claim.f_manufacturerCode == PacketInterpreter::MANUFACTURER_AIRMAR
+		%w{UST800}.include?(device.product_information&.f_modelId)
+	end
+
+	def event_device_discovered(device)
+		if compatible_device?(device) && !@device
+			start_calibration(device)
+		end
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class DumpEventJob
+	def self.spawn(event_loop, event_id)
+		job = self.new
+		job.define_singleton_method("event_#{event_id}") do |*args|
+			puts("Event #{event_id}: #{args.join(', ')}")
+		end
+		event_loop.add_job(job)
+		job
+	end
+end
+
+class ExitAfterEventJob
+	def self.spawn(event_loop, event_id)
+		job = self.new(event_loop)
+		job.define_singleton_method("event_#{event_id}") do |*_args|
+			@event_loop.exit!
+		end
+		event_loop.add_job(job)
+		job
+	end
+
+	def initialize(event_loop)
+		@event_loop = event_loop
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class EventLoop
+	def initialize
+		@exit = false
+		@jobs = []
+	end
+
+	def exit!
+		@exit = true
+	end
+
+	def exit?
+		@exit
+	end
+
+	def tick
+		@jobs.dup.each do |job|
+			begin
+				job.tick if job.respond_to?(:tick)
+			rescue => e
+				message(:warning, "job #{job} raised #{e} during tick")
+				message(:warning, e.backtrace.join("\n"))
+			end
+		end
+	end
+
+	def event(event_id, *args)
+		meth = "event_#{event_id}"
+		@jobs.dup.each do |job|
+			begin
+				job.send(meth, *args) if job.respond_to?(meth, true)
+			rescue => e
+				message(:warning, "job #{job} raised #{e} processing event #{event_id}")
+				message(:warning, e.backtrace.join("\n"))
+			end
+		end
+	end
+
+	def add_job(job)
+		raise ArgumentError.new('job already added') if @jobs.include?(job)
+		@jobs << job
+	end
+
+	def remove_job(job)
+		raise ArgumentError.new('job not found') unless @jobs.include?(job)
+		@jobs -= [job]
+	end
+
+	def remove_all_jobs_of_type(klass)
+		@jobs.reject! { |job| job.is_a?(klass) }
+	end
 end
 
 #----------------------------------------------------------------------------
@@ -1081,14 +1707,15 @@ def parse_params
 		end
 		opts.on('-r', '--driver=NAME', "driver: #{drivers.join(', ')}")
 		opts.on('-s', '--stats', 'display stats on exit')
+		opts.on('-v', '--verbose', 'display PGNs received')
 	end.parse!(into: params)
 	params[:driver] ||= DEFAULT_DRIVER_NAME
 	params
 end
 
-def error(msg)
-	puts("#{PROG_NAME}: error: #{msg}")
-	exit(1)
+def message(level, msg)
+	puts("#{PROG_NAME}: #{level}: #{msg}") unless level == :debug
+	exit(1) if level == :error
 end
 
 def load_pgn_database
@@ -1099,29 +1726,33 @@ end
 
 def main
 	pgn_database = load_pgn_database
+	PGN.pgn_database = pgn_database
 
 	params = parse_params
 
 	if params[:file] && params[:device]
-		error('please specify either a device or file, not both')
+		message(:error, 'please specify either a device or file, not both')
 	end
 
 	driver_class = Driver.class_from_name(params[:driver])
 	unless driver_class
-		error("unrecognized driver name: #{params[:driver]}")
+		message(:error, "unrecognized driver name: #{params[:driver]}")
 	end
 	driver = driver_class.new(pgn_database, params)
 	driver.start
 
-	packet_interpreter = PacketInterpreter.new(pgn_database)
+	event_loop = EventLoop.new
+
+	ReadPacketsJob.spawn(event_loop, driver, pgn_database)
+	DumpEventJob.spawn(event_loop, :pgn) if params[:verbose]
+	#EnumerateNetworkDevicesJob.spawn(event_loop, driver)
+	#DumpEventJob.spawn(event_loop, :device_discovered)
+	AirmarCalibratePaddleWheelJob.spawn(event_loop, driver)
 
 	begin
-		while true
-			packet = driver.update
-			puts(packet_interpreter.interpret(packet)) if packet
+		while !event_loop.exit?
+			event_loop.tick
 		end
-	rescue EOFError
-		# ok
 	ensure
 		puts(driver.stats) if params[:stats]
 		driver.stop
