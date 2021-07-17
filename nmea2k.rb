@@ -62,10 +62,10 @@ class Driver
 	end
 
 	def send(packet, destination, priority)
-		return false unless allow_tx?
 		packet = packet.serialize if packet.is_a?(PGN)
 		packet = packet.merge(:destination => destination, :priority => priority)
-		write_packet(packet)
+		puts "send: #{packet}"
+		allow_tx? && write_packet(packet)
 	end
 
 	def packets_coalesced?
@@ -477,11 +477,11 @@ class PGNDatabase
 		@db = db.deep_freeze
 	end
 
-	def find(index, id = nil)
-		list = @pgns[index]
+	def find(pgn_num, pgn_id = nil)
+		list = @pgns[pgn_num]
 		return nil unless list
 		if list.size > 1
-			list[id] || list[:default] || ambiguous(index)
+			list[pgn_id] || list[:default] || ambiguous(pgn_num)
 		else
 			list.first.last
 		end
@@ -502,14 +502,14 @@ class PGNDatabase
 		pgns.first
 	end
 
-	def ambiguous(index)
-		raise ArgumentError.new("PGN #{index} must specify id to disambiguate")
+	def ambiguous(pgn_num)
+		raise ArgumentError.new("PGN #{pgn_num} must specify id to disambiguate")
 	end
 
 	# Apply local modifications to PGN database
 	def apply_modifications(pgns)
 		raise NotImplementedError unless pgns[60928].size == 1
-		pgns[60928].first.last[:Fields][0][:Type] = PGN::FIELDTYPE_INTEGER
+		pgns[60928].first.last[:Fields][0][:Type] = FieldType::INTEGER
 		set_defaults(pgns)
 	end
 
@@ -531,6 +531,23 @@ class PGNDatabase
 		pgn[:Type] = pgn[:Type].to_sym
 		pgn[:Fields] = pgn[:Fields].values if pgn[:Fields].is_a?(Hash)
 		pgn
+	end
+
+	module FieldType
+		ASCII_TEXT = 'ASCII text'.freeze
+		ASCII_OR_UNICODE = 'ASCII or UNICODE string starting with length and control byte'.freeze
+		BINARY = 'Binary data'.freeze
+		DATE = 'Date'.freeze
+		INTEGER = 'Integer'.freeze
+		LATITUDE = 'Latitude'.freeze
+		LONGITUDE = 'Longitude'.freeze
+		LOOKUP_TABLE = 'Lookup table'.freeze
+		MANUFACTURER_CODE = 'Manufacturer code'.freeze
+		PRESSURE = 'Pressure'.freeze
+		PRESSURE_HIRES = 'Pressure (hires)'.freeze
+		TEMPERATURE = 'Temperature'.freeze
+		TEMPERATURE_HIRES = 'Temperature (hires)'.freeze
+		TIME = 'Time'.freeze
 	end
 end
 
@@ -664,29 +681,29 @@ class PacketInterpreter
 			:description => field_desc[:Name] || field_desc[:Id],
 		}
 		field_value.merge!(case field_desc[:Type]
-			when FIELDTYPE_ASCII_TEXT
+			when PGNDatabase::FieldType::ASCII_TEXT
 				ascii_field_value(field_desc, packet)
-			when FIELDTYPE_ASCII_OR_UNICODE
+			when PGNDatabase::FieldType::ASCII_OR_UNICODE
 				unicode_field_value(field_desc, packet)
-			when FIELDTYPE_INTEGER
+			when PGNDatabase::FieldType::INTEGER
 				numeric_field_value(field_desc, packet, 1)
-			when FIELDTYPE_DATE, FIELDTYPE_TIME
+			when PGNDatabase::FieldType::DATE, PGNDatabase::FieldType::TIME
 				numeric_field_value(field_desc, packet)
-			when FIELDTYPE_LATITUDE
+			when PGNDatabase::FieldType::LATITUDE
 				latlon_field_value(field_desc, packet, 2, 'N', 'S')
-			when FIELDTYPE_LONGITUDE
+			when PGNDatabase::FieldType::LONGITUDE
 				latlon_field_value(field_desc, packet, 3, 'E', 'W')
-			when FIELDTYPE_PRESSURE, FIELDTYPE_PRESSURE_HIRES
+			when PGNDatabase::FieldType::PRESSURE, PGNDatabase::FieldType::PRESSURE_HIRES
 				numeric_field_value(field_desc, packet)
-			when FIELDTYPE_TEMPERATURE, FIELDTYPE_TEMPERATURE_HIRES
+			when PGNDatabase::FieldType::TEMPERATURE, PGNDatabase::FieldType::TEMPERATURE_HIRES
 				numeric_field_value(field_desc, packet)
 			when nil	# numeric
 				numeric_field_value(field_desc, packet)
-			when FIELDTYPE_BINARY
+			when PGNDatabase::FieldType::BINARY
 				binary_field_value(field_desc, packet)
-			when FIELDTYPE_LOOKUP_TABLE
+			when PGNDatabase::FieldType::LOOKUP_TABLE
 				enum_field_value(pgn_desc, field_desc, packet)
-			when FIELDTYPE_MANUFACTURER_CODE
+			when PGNDatabase::FieldType::MANUFACTURER_CODE
 				manufacturer_field_value(field_desc, packet)
 			else
 				{ :value => nil, :note => "unknown field type '#{field_desc[:Type]}'" }
@@ -801,21 +818,6 @@ class PacketInterpreter
 		accumulator >>= start_bit & 7
 		accumulator & ((1 << bit_length) - 1)
 	end
-
-	FIELDTYPE_ASCII_TEXT = 'ASCII text'.freeze
-	FIELDTYPE_ASCII_OR_UNICODE = 'ASCII or UNICODE string starting with length and control byte'.freeze
-	FIELDTYPE_BINARY = 'Binary data'.freeze
-	FIELDTYPE_DATE = 'Date'.freeze
-	FIELDTYPE_INTEGER = 'Integer'.freeze
-	FIELDTYPE_LATITUDE = 'Latitude'.freeze
-	FIELDTYPE_LONGITUDE = 'Longitude'.freeze
-	FIELDTYPE_LOOKUP_TABLE = 'Lookup table'.freeze
-	FIELDTYPE_MANUFACTURER_CODE = 'Manufacturer code'.freeze
-	FIELDTYPE_PRESSURE = 'Pressure'.freeze
-	FIELDTYPE_PRESSURE_HIRES = 'Pressure (hires)'.freeze
-	FIELDTYPE_TEMPERATURE = 'Temperature'.freeze
-	FIELDTYPE_TEMPERATURE_HIRES = 'Temperature (hires)'.freeze
-	FIELDTYPE_TIME = 'Time'.freeze
 
 	MANUFACTURERS = {
 		# From "NMEA 2000 Registration Numbers" April 9, 2014
@@ -934,22 +936,6 @@ class PacketInterpreter
 		717 => 'YACHT DEVICES LTD.',
 	}.deep_freeze
 
-	MANUFACTURERS.each do |id, name|
-		{
-			'&' => '_AND_',
-			'.' => '',
-			',' => '',
-			'(' => '',
-			')' => '',
-			'/' => '_',
-			'-' => '_',
-			' ' => '_',
-		}.each do |str, repl|
-			name = name.gsub(str, repl)
-		end
-		const_set("MANUFACTURER_#{name.upcase}", id)
-	end
-
 	EMPTY_HASH = {}.freeze
 end
 
@@ -1031,28 +1017,32 @@ class PGN
 	def initialize(fields = {})
 		@fields = {}
 		fields.each do |key, value|
-			_set_field(key, value)
+			send("f_#{key}=", value)
 		end
 	end
 
-	def pgn_id
-		self.class::PGN_ID
+	def pgn_num
+		self.class.pgn_num
+	end
+
+	def pgn_desc
+		self.class.pgn_desc
 	end
 
 	# returns a packet
 	def serialize
-		buffer = ByteBuffer.new(length: self.class.pgn_desc[:Length])
-		self.class.pgn_desc[:Fields].each { |field_desc| _serialize_field(field_desc, buffer) }
+		buffer = ByteBuffer.new(length: pgn_desc[:Length])
+		pgn_desc[:Fields].each { |field_desc| _serialize_field(field_desc, buffer) }
 		{
-			:pgn => pgn_id,
+			:pgn => pgn_num,
 			:payload => buffer.data,
 		}
 	end
 
 	# TODO: move deserialization here and get rid of PGN interpreter
 	def self.deserialize(pgn_interpreter, packet)
-		pgn_id = packet[:pgn]
-		pgn_class = class_for_id(pgn_id)
+		pgn_num = packet[:pgn]
+		pgn_class = class_for_id(pgn_num)
 		return nil unless pgn_class		# should not be possible
 		pgn_obj = pgn_class.new
 		pgn_obj.send(:_deserialize, pgn_interpreter, packet)
@@ -1066,7 +1056,7 @@ class PGN
 		end
 		name = self.class.name
 		name = name[0...-3] if name&.end_with?('PGN')
-		name ||= "PGN#{pgn_id}"
+		name ||= "PGN#{pgn_num}"
 		"<#{name}: #{fields.join(' ')}>"
 	end
 
@@ -1118,12 +1108,12 @@ class PGN
 		field_type = field_desc[:Type]
 		field_value = @fields[field_id]
 		case field_type
-			when FIELDTYPE_ASCII_TEXT
+			when PGNDatabase::FieldType::ASCII_TEXT
 				_serialize_ascii_field(field_desc, field_value, buffer)
-			#when FIELDTYPE_ASCII_OR_UNICODE
+			#when PGNDatabase::FieldType::ASCII_OR_UNICODE
 			#	unicode_field_value(field_desc, packet)
-			when FIELDTYPE_INTEGER
-				_serialize_numeric_field(field_desc, field_value, buffer, 1)
+			when PGNDatabase::FieldType::INTEGER
+				serialize_numeric_field(field_desc, field_value, buffer, 1)
 			#when FIELDTYPE_DATE, FIELDTYPE_TIME
 			#	numeric_field_value(field_desc, packet)
 			#when FIELDTYPE_LATITUDE
@@ -1135,16 +1125,26 @@ class PGN
 			#when FIELDTYPE_TEMPERATURE, FIELDTYPE_TEMPERATURE_HIRES
 			#	numeric_field_value(field_desc, packet)
 			when nil	# numeric
-				_serialize_numeric_field(field_desc, field_value, buffer)
+				serialize_numeric_field(field_desc, field_value, buffer)
 			#when FIELDTYPE_BINARY
 			#	binary_field_value(field_desc, packet)
-			#when FIELDTYPE_LOOKUP_TABLE
-			#	enum_field_value(pgn_desc, field_desc, packet)
-			#when FIELDTYPE_MANUFACTURER_CODE
-			#	manufacturer_field_value(field_desc, packet)
+			when PGNDatabase::FieldType::LOOKUP_TABLE
+				serialize_enum_field(field_desc, field_value, buffer)
+			when PGNDatabase::FieldType::MANUFACTURER_CODE
+				serialize_manufacturer_field(field_desc, field_value, buffer)
 			else
 				raise NotImplementedError.new("unknown field type '#{field_type}'")
 		end
+	end
+
+	def serialize_enum_field(field_desc, field_value, buffer)
+		# TODO: Permit string values
+		serialize_numeric_field(field_desc, field_value, buffer, 1)
+	end
+
+	def serialize_manufacturer_field(field_desc, field_value, buffer)
+		# TODO: Permit string values
+		serialize_numeric_field(field_desc, field_value, buffer, 1)
 	end
 
 	def _serialize_ascii_field(field_desc, field_value, buffer)
@@ -1153,10 +1153,10 @@ class PGN
 		buffer.write_bytes(field_value, field_desc[:BitOffset], field_desc[:BitLength])
 	end
 
-	def _serialize_numeric_field(field_desc, field_value, buffer, scale = nil)
+	def serialize_numeric_field(field_desc, field_value, buffer, scale = nil)
 		scale = (field_desc[:Resolution] || 1) if scale.nil?
-		scale = scale.to_f
-		field_value = (field_value / scale).to_i
+		scale = (1.0 / scale.to_f).to_i
+		field_value = (field_value.to_f * scale).to_i
 		field_max = 1 << field_desc[:BitLength]
 		if field_desc[:Signed]
 			field_min = -(field_max >> 1)
@@ -1173,7 +1173,7 @@ class PGN
 
 	def _deserialize(packet_interpreter, packet)
 		interp = packet_interpreter.interpret(packet)
-		unless interp[:pgn] == self.class::PGN_ID
+		unless interp[:pgn] == pgn_num
 			raise ArgumentError
 		end
 		@fields = {}
@@ -1205,7 +1205,7 @@ class PGN
 	end
 
 	def _construct_field_list
-		fields = self.class.pgn_desc[:Fields]
+		fields = pgn_desc[:Fields]
 		fields = fields.map { |f| f[:Id].to_sym }.uniq
 		fields = fields.select { |f| allow_field?(f) }
 		fields.to_set.freeze
@@ -1225,14 +1225,20 @@ class PGN
 	end
 
 	class << self
-		attr_accessor :pgn_database
+		attr_reader :pgn_database
 
-		def pgn_desc
-			PGN.pgn_database[self::PGN_ID]
+		def pgn_database=(value)
+			@pgn_database = value
+			ObjectSpace.each_object(Class).select { |klass| klass < PGN }.each { |klass| finish_class(klass) }
 		end
 
-		def class_for_id(pgn_id, &block)
-			classes_by_id[pgn_id] ||= block_given? ? new_class_for_id(pgn_id, &block) : new_class_for_id(pgn_id)
+		def class_for_id(pgn_num, pgn_id = nil, &block)
+			classes_by_id[pgn_num] ||= {}
+			classes_by_id[pgn_num][pgn_id || :default] ||= if block_given?
+				new_class_for_id(pgn_num, pgn_id, &block)
+			else
+				new_class_for_id(pgn_num, pgn_id)
+			end
 		end
 
 		def field_type(field_name, type_klass)
@@ -1245,19 +1251,31 @@ class PGN
 		private
 
 		def classes_by_id
-			@classes_by_id ||= construct_classes_by_id
+			@classes_by_id ||= {}
 		end
 
-		def construct_classes_by_id
-			klasses = ObjectSpace.each_object(Class).select { |klass| klass < PGN }
-			Hash[klasses.map { |klass| [klass::PGN_ID, klass] }]
-		end
-
-		def new_class_for_id(pgn_id, &block)
-			Class.new(self) do |k|
-				k.const_set('PGN_ID', pgn_id)
-				k.module_eval(&block) if block_given?
+		def new_class_for_id(pgn_num, pgn_id, &block)
+			klass = Class.new(self) do |klass|
+				klass.class.class_eval do
+					#class << self
+						attr_reader :pgn_num, :pgn_id, :pgn_desc
+					#end
+				end
+				klass.instance_variable_set(:@pgn_num, pgn_num)
+				klass.instance_variable_set(:@pgn_id, pgn_id)
+				klass.module_eval(&block) if block_given?
 			end
+			finish_class(klass) if PGN.pgn_database
+			klass
+		end
+
+		def finish_class(klass)
+			pgn_desc = PGN.pgn_database.find(klass.pgn_num, klass.pgn_id)
+			raise ArgumentError.new("PGN not in database: #{pgn_num}") unless pgn_desc
+			# if pgn_id had been nil, we now have a concrete id
+			klass.instance_variable_set(:@pgn_id, pgn_desc[:Id])
+			klass.instance_variable_set(:@pgn_desc, pgn_desc)
+			classes_by_id[klass.pgn_num][klass.pgn_id] = klass
 		end
 	end
 
@@ -1269,22 +1287,38 @@ class PGN
 		def [](name)
 			@obj.send(:_get_field, name)
 		end
+
+		def []=(name, value)
+			@obj.send(:_set_field, name, value)
+		end
 	end
 
-	FIELDTYPE_ASCII_TEXT = 'ASCII text'.freeze
-	FIELDTYPE_ASCII_OR_UNICODE = 'ASCII or UNICODE string starting with length and control byte'.freeze
-	FIELDTYPE_BINARY = 'Binary data'.freeze
-	FIELDTYPE_DATE = 'Date'.freeze
-	FIELDTYPE_INTEGER = 'Integer'.freeze
-	FIELDTYPE_LATITUDE = 'Latitude'.freeze
-	FIELDTYPE_LONGITUDE = 'Longitude'.freeze
-	FIELDTYPE_LOOKUP_TABLE = 'Lookup table'.freeze
-	FIELDTYPE_MANUFACTURER_CODE = 'Manufacturer code'.freeze
-	FIELDTYPE_PRESSURE = 'Pressure'.freeze
-	FIELDTYPE_PRESSURE_HIRES = 'Pressure (hires)'.freeze
-	FIELDTYPE_TEMPERATURE = 'Temperature'.freeze
-	FIELDTYPE_TEMPERATURE_HIRES = 'Temperature (hires)'.freeze
-	FIELDTYPE_TIME = 'Time'.freeze
+	module Manufacturer
+		PacketInterpreter::MANUFACTURERS.each do |id, name|
+			{
+				'&' => '_AND_',
+				'.' => '',
+				',' => '',
+				'(' => '',
+				')' => '',
+				'/' => '_',
+				'-' => '_',
+				' ' => '_',
+			}.each do |str, repl|
+				name = name.gsub(str, repl)
+			end
+			const_set(name.upcase, id)
+		end
+	end
+
+	module Industry
+		GLOBAL = 0
+		HIGHWAY = 1
+		AGRICULTURE = 2
+		CONSTRUCTION = 3
+		MARINE = 4
+		INDUSTRIAL = 5
+	end
 end
 
 # Attributes:
@@ -1300,7 +1334,12 @@ end
 
 # Attributes:
 # => f_pgn (Integer)
-ISORequestPGN = PGN.class_for_id(59904)
+ISORequestPGN = PGN.class_for_id(59904) do
+	def f_pgn=(value)
+		value = value.pgn_num if value.respond_to?(:pgn_num)
+		field[:pgn] = value
+	end
+end
 
 # Attributes:
 # => f_uniqueNumber
@@ -1314,6 +1353,15 @@ ISORequestPGN = PGN.class_for_id(59904)
 ISOAddressClaimPGN = PGN.class_for_id(60928)
 
 AddressableMultiFrameProprietaryPGN = PGN.class_for_id(126720)
+
+# Attributes:
+# => f_manufacturerCode
+# => f_industryCode
+# => f_proprietaryId
+# => f_numberOfPairsOfDataPoints - actual range is 0 to 25. 254=restore default speed curve
+# => f_inputFrequency
+# => f_outputSpeed
+AirmarCalibrateSpeedPGN = PGN.class_for_id(126720, 'airmarCalibrateSpeed')
 
 # Attributes:
 # => f_nmea2000Version
@@ -1573,8 +1621,7 @@ class AirmarCalibratePaddleWheelJob
 	def start_calibration(device)
 		if compatible_device?(device)
 			@device = device
-			#request = ISORequestPGN.new(:pgn => ISOAddressClaimPGN)
-			#@driver.send(request, device.address, 6)
+			@driver.send(calibration_pgn, device.address, 6)
 			@event_loop.event(:begin_calibration, device)
 			@start_time = Time.now
 			@end_time = @start_time + @timeout
@@ -1584,6 +1631,17 @@ class AirmarCalibratePaddleWheelJob
 	end
 
 	private
+
+	def calibration_pgn
+		AirmarCalibrateSpeedPGN.new(
+			:manufacturerCode => PGN::Manufacturer::AIRMAR,
+			:industryCode => PGN::Industry::MARINE,
+			:proprietaryId => 41,
+			:numberOfPairsOfDataPoints => 1,
+			:inputFrequency => 10,
+			:outputSpeed => 1,
+		)
+	end
 
 	def calibration_failed
 		end_with_event(:calibration_failed)
@@ -1595,8 +1653,7 @@ class AirmarCalibratePaddleWheelJob
 	end
 
 	def compatible_device?(device)
-		return false unless device.address_claim.f_manufacturerCode == PacketInterpreter::MANUFACTURER_AIRMAR
-		%w{UST800}.include?(device.product_information&.f_modelId)
+		device.address_claim.f_manufacturerCode == PGN::Manufacturer::AIRMAR
 	end
 
 	def event_device_discovered(device)
@@ -1747,7 +1804,7 @@ def main
 	DumpEventJob.spawn(event_loop, :pgn) if params[:verbose]
 	#EnumerateNetworkDevicesJob.spawn(event_loop, driver)
 	#DumpEventJob.spawn(event_loop, :device_discovered)
-	AirmarCalibratePaddleWheelJob.spawn(event_loop, driver)
+	#AirmarCalibratePaddleWheelJob.spawn(event_loop, driver)
 
 	begin
 		while !event_loop.exit?
