@@ -218,6 +218,7 @@ class YDNU_RawDriver < YDNUDriverBase
 		# 04:04:45.667 R 0DF50B69 00 E8 00 00 00 00 00 FF
 		line = @file.gets&.chomp
 		raise EOFError if line.nil?
+		#puts line
 		time_h =  Integer(line[0...2], 10)
 		time_m =  Integer(line[3...5], 10)
 		time_s =  Integer(line[6...8], 10)
@@ -614,6 +615,16 @@ class TemperatureKelvin < GenericValue
 
 	def to_s
 		"#{sprintf('%.1f', to_celcius)}°C"
+	end
+end
+
+class PressureDeciPascals < GenericValue
+	def to_millibars
+		to_f * 0.001
+	end
+
+	def to_s
+		"#{sprintf('%.1f', to_millibars)}mb"
 	end
 end
 
@@ -1374,6 +1385,12 @@ AirmarCalibrateSpeedPGN = PGN.class_for_id(126720, 'airmarCalibrateSpeed')
 # => f_loadEquivalency
 ProductInformationPGN = PGN.class_for_id(126996)
 
+VesselHeadingPGN = PGN.class_for_id(127250) do
+	field_type :heading, AngleRadians
+	field_type :deviation, AngleRadians
+	field_type :variation, AngleRadians
+end
+
 SpeedPGN = PGN.class_for_id(128259) do
 	field_type :speedWaterReferenced, KnotSpeedMetersPerSecond
 	field_type :speedGroundReferenced, KnotSpeedMetersPerSecond
@@ -1440,6 +1457,10 @@ TemperaturePGN = PGN.class_for_id(130312) do
 	field_type :setTemperature, TemperatureKelvin
 end
 
+ActualPressurePGN = PGN.class_for_id(130314) do
+	field_type :pressure, PressureDeciPascals
+end
+
 TemperatureExtendedRangePGN = PGN.class_for_id(130316) do
 	field_type :temperature, TemperatureKelvin
 	field_type :setTemperature, TemperatureKelvin
@@ -1467,18 +1488,17 @@ end
 #----------------------------------------------------------------------------
 
 class ReadPacketsJob
-	def self.spawn(event_loop, driver, pgn_database)
-		job = self.new(event_loop, driver, pgn_database)
+	def self.spawn(event_loop, driver)
+		job = self.new(event_loop, driver)
 		event_loop.add_job(job)
 		job
 	end
 
 	attr_reader :driver
 
-	def initialize(event_loop, driver, pgn_database)
+	def initialize(event_loop, driver)
 		@event_loop = event_loop
 		@driver = driver
-		@packet_interpreter = PacketInterpreter.new(pgn_database)	# TODO
 	end
 
 	def tick
@@ -1496,7 +1516,28 @@ class ReadPacketsJob
 
 	def ingest(packet)
 		return unless packet
-		#puts(@packet_interpreter.interpret(packet))
+		#puts packet
+		@event_loop.event(:packet, packet)
+	end
+end
+
+#----------------------------------------------------------------------------
+
+class PacketsToPGNsJob
+	def self.spawn(event_loop, pgn_database)
+		job = self.new(event_loop, pgn_database)
+		event_loop.add_job(job)
+		job
+	end
+
+	def initialize(event_loop, pgn_database)
+		@event_loop = event_loop
+		@packet_interpreter = PacketInterpreter.new(pgn_database)	# TODO
+	end
+
+	private
+
+	def event_packet(packet)
 		pgn = PGN.deserialize(@packet_interpreter, packet)
 		return unless pgn
 		@event_loop.event(:pgn, pgn, packet[:source])
@@ -1756,7 +1797,7 @@ def parse_params
 	params = {}
 	OptionParser.new do |opts|
 		opts.banner = "Usage: #{PROG_NAME} [options]"
-		opts.on('-d', '--device=PATH', 'device to read/write')
+		opts.on('-d', '--device=PATH', 'device to read/write (try ls /dev/cu.usbm* for devices)')
 		opts.on('-f', '--file=PATH', 'file to read')
 		opts.on('-h', '--help', 'show this help') do
 			puts opts
@@ -1800,7 +1841,8 @@ def main
 
 	event_loop = EventLoop.new
 
-	ReadPacketsJob.spawn(event_loop, driver, pgn_database)
+	ReadPacketsJob.spawn(event_loop, driver)
+	PacketsToPGNsJob.spawn(event_loop, pgn_database)
 	DumpEventJob.spawn(event_loop, :pgn) if params[:verbose]
 	#EnumerateNetworkDevicesJob.spawn(event_loop, driver)
 	#DumpEventJob.spawn(event_loop, :device_discovered)
